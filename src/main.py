@@ -1,17 +1,43 @@
 """
-ETL Pipeline - Nettoyage et transformation de données
+ETL Pipeline enrichi - Sauvegarde & Historisation
 Jeu de données : ventes de produits (ID, Nom, Quantité, Prix, Date)
+
+Nouveautés :
+  - Sauvegarde locale horodatée (raw / cleaned / transformed)
+  - Historisation : chaque exécution crée un dossier daté, un manifeste JSON
+    et un registre global d'historique (history_registry.csv)
+  - Modules optionnels Google Cloud Storage et Amazon S3
 """
 
+import os
+import json
+import shutil
+import hashlib
 import pandas as pd
 import numpy as np
 import logging
 import unittest
 from io import StringIO
+from datetime import datetime
+from pathlib import Path
 
-# ─────────────────────────────────────────────
-# 1. CONFIGURATION DU LOGGER
-# ─────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+# 1. CONFIGURATION
+# ════════════════════════════════════════════════════════════
+
+# Répertoire racine de stockage (modifiable)
+STORAGE_ROOT = Path("etl_storage")
+
+# Optionnel – Google Cloud Storage
+GCS_ENABLED      = False
+GCS_BUCKET_NAME  = "mon-bucket-gcs"          # à remplacer
+GCS_PROJECT_ID   = "mon-projet-gcp"          # à remplacer
+
+# Optionnel – Amazon S3
+S3_ENABLED       = False
+S3_BUCKET_NAME   = "mon-bucket-s3"           # à remplacer
+S3_REGION        = "eu-west-1"               # à remplacer
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -23,11 +49,219 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────
-# 2. CHARGEMENT DES DONNÉES
-# ─────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+# 2. GESTIONNAIRE DE SAUVEGARDE & HISTORISATION
+# ════════════════════════════════════════════════════════════
+
+class StorageManager:
+    """
+    Gère la sauvegarde locale et l'historisation horodatée.
+    Structure créée :
+        etl_storage/
+          history_registry.csv          ← registre global de toutes les exécutions
+          runs/
+            20240315_143022/            ← un dossier par exécution
+              manifest.json             ← métadonnées de l'exécution
+              raw_data.csv
+              cleaned_data.csv
+              transformed_data.csv
+              aggregation_mensuelle.csv
+    """
+
+    REGISTRY_FILE = "history_registry.csv"
+
+    def __init__(self, root: Path = STORAGE_ROOT):
+        self.root      = Path(root)
+        self.runs_dir  = self.root / "runs"
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_dir   = self.runs_dir / self.timestamp
+        self._init_dirs()
+
+    # ── Initialisation ──────────────────────────────────────
+    def _init_dirs(self):
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"[STORAGE] Dossier d'exécution : {self.run_dir}")
+
+    # ── Calcul checksum ─────────────────────────────────────
+    @staticmethod
+    def _md5(df: pd.DataFrame) -> str:
+        return hashlib.md5(
+            pd.util.hash_pandas_object(df, index=True).values.tobytes()
+        ).hexdigest()
+
+    # ── Sauvegarde d'un DataFrame ───────────────────────────
+    def save(self, df: pd.DataFrame, stage: str) -> Path:
+        """
+        Sauvegarde un DataFrame dans le dossier de l'exécution courante.
+        stage : 'raw' | 'cleaned' | 'transformed' | 'aggregation'
+        """
+        filename = f"{stage}_data.csv" if stage != "aggregation" else "aggregation_mensuelle.csv"
+        filepath = self.run_dir / filename
+        df.to_csv(filepath, index=False)
+        size_kb = filepath.stat().st_size / 1024
+        logger.info(f"[STORAGE] Sauvegarde '{stage}' → {filepath} ({size_kb:.1f} Ko, {len(df)} lignes)")
+        return filepath
+
+    # ── Manifeste JSON ──────────────────────────────────────
+    def write_manifest(self, meta: dict):
+        """Écrit un fichier JSON décrivant l'exécution."""
+        meta["timestamp"]  = self.timestamp
+        meta["run_dir"]    = str(self.run_dir)
+        manifest_path = self.run_dir / "manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, default=str)
+        logger.info(f"[STORAGE] Manifeste écrit : {manifest_path}")
+
+    # ── Registre global d'historique ────────────────────────
+    def register_run(self, meta: dict):
+        """
+        Ajoute une ligne dans le fichier CSV global d'historique.
+        Crée le fichier s'il n'existe pas encore.
+        """
+        registry_path = self.root / self.REGISTRY_FILE
+        record = {
+            "timestamp":       self.timestamp,
+            "run_dir":         str(self.run_dir),
+            "lignes_brutes":   meta.get("lignes_brutes", ""),
+            "lignes_nettoyees":meta.get("lignes_nettoyees", ""),
+            "doublons_suppr":  meta.get("doublons_supprimes", ""),
+            "checksum_clean":  meta.get("checksum_cleaned", ""),
+            "statut":          meta.get("statut", "OK"),
+        }
+        new_row = pd.DataFrame([record])
+
+        if registry_path.exists():
+            existing = pd.read_csv(registry_path)
+            registry = pd.concat([existing, new_row], ignore_index=True)
+        else:
+            registry = new_row
+
+        registry.to_csv(registry_path, index=False)
+        logger.info(f"[STORAGE] Registre mis à jour : {registry_path}")
+
+    # ── Copie "latest" pour accès rapide ────────────────────
+    def update_latest(self):
+        """Copie le dossier courant vers etl_storage/latest/."""
+        latest_dir = self.root / "latest"
+        if latest_dir.exists():
+            shutil.rmtree(latest_dir)
+        shutil.copytree(self.run_dir, latest_dir)
+        logger.info(f"[STORAGE] Dossier 'latest' mis à jour → {latest_dir}")
+
+    # ── Lister l'historique ──────────────────────────────────
+    def list_history(self) -> pd.DataFrame:
+        """Retourne le registre complet des exécutions passées."""
+        registry_path = self.root / self.REGISTRY_FILE
+        if not registry_path.exists():
+            return pd.DataFrame()
+        return pd.read_csv(registry_path)
+
+    # ── Restaurer une version précédente ────────────────────
+    def restore_version(self, timestamp: str, stage: str = "cleaned") -> pd.DataFrame:
+        """
+        Charge un DataFrame d'une exécution passée.
+        timestamp : ex. '20240315_143022'
+        stage     : 'raw' | 'cleaned' | 'transformed' | 'aggregation'
+        """
+        filename  = f"{stage}_data.csv" if stage != "aggregation" else "aggregation_mensuelle.csv"
+        filepath  = self.runs_dir / timestamp / filename
+        if not filepath.exists():
+            raise FileNotFoundError(f"Version introuvable : {filepath}")
+        df = pd.read_csv(filepath)
+        logger.info(f"[STORAGE] Version restaurée : {filepath} ({len(df)} lignes)")
+        return df
+
+
+# ════════════════════════════════════════════════════════════
+# 3. MODULE GOOGLE CLOUD STORAGE (optionnel)
+# ════════════════════════════════════════════════════════════
+
+class GCSUploader:
+    """
+    Upload les fichiers ETL vers Google Cloud Storage.
+    Nécessite : pip install google-cloud-storage
+    Authentification : variable d'environnement GOOGLE_APPLICATION_CREDENTIALS
+    """
+
+    def __init__(self, bucket_name: str, project_id: str):
+        try:
+            from google.cloud import storage
+            self.client = storage.Client(project=project_id)
+            self.bucket = self.client.bucket(bucket_name)
+            self.bucket_name = bucket_name
+            logger.info(f"[GCS] Connecté au bucket : gs://{bucket_name}")
+        except ImportError:
+            raise ImportError("Installez google-cloud-storage : pip install google-cloud-storage")
+        except Exception as e:
+            raise ConnectionError(f"[GCS] Connexion impossible : {e}")
+
+    def upload(self, local_path: Path, timestamp: str, stage: str):
+        """Upload un fichier local vers GCS avec préfixe horodaté."""
+        destination = f"etl_runs/{timestamp}/{local_path.name}"
+        blob = self.bucket.blob(destination)
+        blob.upload_from_filename(str(local_path))
+        gcs_uri = f"gs://{self.bucket_name}/{destination}"
+        logger.info(f"[GCS] Fichier uploadé : {gcs_uri}")
+        return gcs_uri
+
+    def upload_run(self, run_dir: Path, timestamp: str):
+        """Upload tous les fichiers d'une exécution."""
+        uris = []
+        for f in run_dir.glob("*.csv"):
+            uris.append(self.upload(f, timestamp, f.stem))
+        for f in run_dir.glob("*.json"):
+            uris.append(self.upload(f, timestamp, f.stem))
+        logger.info(f"[GCS] {len(uris)} fichier(s) uploadé(s) pour l'exécution {timestamp}")
+        return uris
+
+
+# ════════════════════════════════════════════════════════════
+# 4. MODULE AMAZON S3 (optionnel)
+# ════════════════════════════════════════════════════════════
+
+class S3Uploader:
+    """
+    Upload les fichiers ETL vers Amazon S3.
+    Nécessite : pip install boto3
+    Authentification : variables AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+    ou profil AWS configuré (~/.aws/credentials)
+    """
+
+    def __init__(self, bucket_name: str, region: str):
+        try:
+            import boto3
+            self.s3 = boto3.client("s3", region_name=region)
+            self.bucket_name = bucket_name
+            logger.info(f"[S3] Connecté au bucket : s3://{bucket_name} (région: {region})")
+        except ImportError:
+            raise ImportError("Installez boto3 : pip install boto3")
+        except Exception as e:
+            raise ConnectionError(f"[S3] Connexion impossible : {e}")
+
+    def upload(self, local_path: Path, timestamp: str):
+        """Upload un fichier local vers S3 avec préfixe horodaté."""
+        key = f"etl_runs/{timestamp}/{local_path.name}"
+        self.s3.upload_file(str(local_path), self.bucket_name, key)
+        s3_uri = f"s3://{self.bucket_name}/{key}"
+        logger.info(f"[S3] Fichier uploadé : {s3_uri}")
+        return s3_uri
+
+    def upload_run(self, run_dir: Path, timestamp: str):
+        """Upload tous les fichiers d'une exécution."""
+        uris = []
+        for f in run_dir.glob("*.csv"):
+            uris.append(self.upload(f, timestamp))
+        for f in run_dir.glob("*.json"):
+            uris.append(self.upload(f, timestamp))
+        logger.info(f"[S3] {len(uris)} fichier(s) uploadé(s) pour l'exécution {timestamp}")
+        return uris
+
+
+# ════════════════════════════════════════════════════════════
+# 5. ÉTAPES ETL (inchangées, enrichies des appels storage)
+# ════════════════════════════════════════════════════════════
+
 def load_data(filepath: str) -> pd.DataFrame:
-    """Charge le fichier CSV et parse les dates."""
     try:
         df = pd.read_csv(filepath, parse_dates=["Date_vente"])
         logger.info(f"Fichier chargé : {filepath} ({len(df)} lignes, {len(df.columns)} colonnes)")
@@ -36,39 +270,27 @@ def load_data(filepath: str) -> pd.DataFrame:
         logger.error(f"Fichier introuvable : {filepath}")
         raise
     except Exception as e:
-        logger.error(f"Erreur lors du chargement : {e}")
+        logger.error(f"Erreur chargement : {e}")
         raise
 
 
-# ─────────────────────────────────────────────
-# 3. ANALYSE INITIALE DES DONNÉES
-# ─────────────────────────────────────────────
 def analyze_data(df: pd.DataFrame) -> dict:
-    """Identifie les problèmes : valeurs manquantes, aberrantes, doublons."""
     try:
         logger.info("=" * 50)
         logger.info("ETAPE 1 : ANALYSE DES DONNEES")
         logger.info("=" * 50)
-
         report = {}
-
-        # Dimensions
         report["shape"] = df.shape
         logger.info(f"Dimensions : {df.shape[0]} lignes x {df.shape[1]} colonnes")
 
-        # Valeurs manquantes
         missing = df.isnull().sum()
-        missing_pct = (missing / len(df) * 100).round(2)
         report["missing"] = missing[missing > 0].to_dict()
-        report["missing_pct"] = missing_pct[missing_pct > 0].to_dict()
         logger.info(f"Valeurs manquantes :\n{missing[missing > 0]}")
 
-        # Doublons
         dupes = df.duplicated(subset=["Nom_produit", "Quantite_vendue", "Prix_unitaire", "Date_vente"]).sum()
         report["duplicates"] = int(dupes)
         logger.info(f"Doublons detectes : {dupes}")
 
-        # Valeurs aberrantes via IQR
         outlier_info = {}
         for col in ["Quantite_vendue", "Prix_unitaire"]:
             q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
@@ -79,73 +301,49 @@ def analyze_data(df: pd.DataFrame) -> dict:
         report["outliers"] = outlier_info
         logger.info(f"Valeurs aberrantes (IQR) : {outlier_info}")
 
-        # Quantités à 0
-        zero_qty = (df["Quantite_vendue"] == 0).sum()
-        report["zero_quantity"] = int(zero_qty)
-        logger.info(f"Quantites a 0 (suspects) : {zero_qty}")
-
+        report["zero_quantity"] = int((df["Quantite_vendue"] == 0).sum())
         return report
-
     except Exception as e:
         logger.error(f"Erreur analyse : {e}")
         raise
 
 
-# ─────────────────────────────────────────────
-# 4. TRAITEMENT DES VALEURS MANQUANTES
-# ─────────────────────────────────────────────
 def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Strategie :
-      - Nom_produit manquant  -> remplace par 'Produit_Inconnu'
-      - Quantite_vendue nulle -> remplacee par la mediane
-      - Prix_unitaire nul     -> remplace par la mediane
-    """
     try:
         logger.info("=" * 50)
         logger.info("ETAPE 2 : TRAITEMENT DES VALEURS MANQUANTES")
         logger.info("=" * 50)
         df = df.copy()
-
         nb = df["Nom_produit"].isnull().sum()
         df["Nom_produit"] = df["Nom_produit"].fillna("Produit_Inconnu")
-        logger.info(f"  'Nom_produit' : {nb} valeur(s) remplacee(s) par 'Produit_Inconnu'")
+        logger.info(f"  'Nom_produit' : {nb} remplacee(s) par 'Produit_Inconnu'")
 
-        mediane_qty = df["Quantite_vendue"].median()
+        m = df["Quantite_vendue"].median()
         nb = df["Quantite_vendue"].isnull().sum()
-        df["Quantite_vendue"] = df["Quantite_vendue"].fillna(mediane_qty)
-        logger.info(f"  'Quantite_vendue' : {nb} valeur(s) remplacee(s) par la mediane ({mediane_qty})")
+        df["Quantite_vendue"] = df["Quantite_vendue"].fillna(m)
+        logger.info(f"  'Quantite_vendue' : {nb} remplacee(s) par mediane ({m})")
 
-        mediane_prix = df["Prix_unitaire"].median()
+        m = df["Prix_unitaire"].median()
         nb = df["Prix_unitaire"].isnull().sum()
-        df["Prix_unitaire"] = df["Prix_unitaire"].fillna(mediane_prix)
-        logger.info(f"  'Prix_unitaire' : {nb} valeur(s) remplacee(s) par la mediane ({mediane_prix})")
+        df["Prix_unitaire"] = df["Prix_unitaire"].fillna(m)
+        logger.info(f"  'Prix_unitaire' : {nb} remplacee(s) par mediane ({m})")
 
         logger.info(f"  Valeurs manquantes restantes : {df.isnull().sum().sum()}")
         return df
-
     except Exception as e:
         logger.error(f"Erreur valeurs manquantes : {e}")
         raise
 
 
-# ─────────────────────────────────────────────
-# 5. GESTION DES VALEURS ABERRANTES
-# ─────────────────────────────────────────────
 def handle_outliers(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ecrete les valeurs hors bornes IQR.
-    Supprime aussi les quantites <= 0 (ventes impossibles).
-    """
     try:
         logger.info("=" * 50)
         logger.info("ETAPE 3 : GESTION DES VALEURS ABERRANTES")
         logger.info("=" * 50)
         df = df.copy()
-
-        nb_zero = (df["Quantite_vendue"] <= 0).sum()
+        nb = (df["Quantite_vendue"] <= 0).sum()
         df = df[df["Quantite_vendue"] > 0].copy()
-        logger.info(f"  Lignes avec Quantite_vendue <= 0 supprimees : {nb_zero}")
+        logger.info(f"  Quantite_vendue <= 0 supprimees : {nb}")
 
         for col in ["Quantite_vendue", "Prix_unitaire"]:
             q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
@@ -154,19 +352,13 @@ def handle_outliers(df: pd.DataFrame) -> pd.DataFrame:
             avant = ((df[col] < lower) | (df[col] > upper)).sum()
             df[col] = df[col].clip(lower=lower, upper=upper)
             logger.info(f"  '{col}' : {avant} valeur(s) ecretee(s) dans [{lower:.2f}, {upper:.2f}]")
-
         return df
-
     except Exception as e:
-        logger.error(f"Erreur valeurs aberrantes : {e}")
+        logger.error(f"Erreur aberrantes : {e}")
         raise
 
 
-# ─────────────────────────────────────────────
-# 6. SUPPRESSION DES DOUBLONS
-# ─────────────────────────────────────────────
 def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
-    """Supprime les doublons sur les colonnes metier."""
     try:
         logger.info("=" * 50)
         logger.info("ETAPE 4 : SUPPRESSION DES DOUBLONS")
@@ -175,78 +367,55 @@ def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
         df = df.drop_duplicates(
             subset=["Nom_produit", "Quantite_vendue", "Prix_unitaire", "Date_vente"]
         ).copy()
-        removed = initial - len(df)
-        logger.info(f"  {removed} doublon(s) supprime(s). Lignes restantes : {len(df)}")
+        logger.info(f"  {initial - len(df)} doublon(s) supprime(s). Lignes restantes : {len(df)}")
         return df
-
     except Exception as e:
-        logger.error(f"Erreur suppression doublons : {e}")
+        logger.error(f"Erreur doublons : {e}")
         raise
 
 
-# ─────────────────────────────────────────────
-# 7. VALIDATION CROISEE
-# ─────────────────────────────────────────────
 def validate(df: pd.DataFrame, step: str) -> bool:
-    """Verifie la qualite du DataFrame apres chaque etape."""
     try:
         logger.info(f"  [VALIDATION apres '{step}']")
         ok = True
-
-        missing = df.isnull().sum().sum()
-        if missing > 0:
-            logger.warning(f"    ! {missing} valeur(s) manquante(s) encore presentes")
+        m = df.isnull().sum().sum()
+        if m > 0:
+            logger.warning(f"    ! {m} valeur(s) manquante(s)")
             ok = False
         else:
             logger.info("    OK - Aucune valeur manquante")
 
-        neg_qty = (df["Quantite_vendue"] <= 0).sum()
-        if neg_qty > 0:
-            logger.warning(f"    ! {neg_qty} quantite(s) <= 0")
+        if (df["Quantite_vendue"] <= 0).sum() > 0:
+            logger.warning(f"    ! Quantites <= 0 presentes")
             ok = False
         else:
-            logger.info("    OK - Toutes les quantites sont positives")
+            logger.info("    OK - Quantites positives")
 
-        neg_price = (df["Prix_unitaire"] <= 0).sum()
-        if neg_price > 0:
-            logger.warning(f"    ! {neg_price} prix <= 0")
+        if (df["Prix_unitaire"] <= 0).sum() > 0:
+            logger.warning(f"    ! Prix <= 0 presents")
             ok = False
         else:
-            logger.info("    OK - Tous les prix sont positifs")
-
+            logger.info("    OK - Prix positifs")
         return ok
-
     except Exception as e:
         logger.error(f"Erreur validation : {e}")
         raise
 
 
-# ─────────────────────────────────────────────
-# 8. TRANSFORMATIONS
-# ─────────────────────────────────────────────
 def transform(df: pd.DataFrame):
-    """
-    Transformations appliquees :
-      T1 - Ajout colonne 'Chiffre_affaires' (prix x quantite)
-      T2 - Normalisation Min-Max du Prix_unitaire -> 'Prix_normalise'
-      T3 - Agregation mensuelle des ventes par produit
-    """
     try:
         logger.info("=" * 50)
-        logger.info("ETAPE 6 : TRANSFORMATIONS")
+        logger.info("ETAPE 5 : TRANSFORMATIONS")
         logger.info("=" * 50)
         df = df.copy()
 
-        # T1 : Chiffre d'affaires
         df["Chiffre_affaires"] = (df["Quantite_vendue"] * df["Prix_unitaire"]).round(2)
-        logger.info("  T1 OK - Colonne 'Chiffre_affaires' ajoutee")
+        logger.info("  T1 OK - 'Chiffre_affaires' ajoutee")
 
-        # T2 : Normalisation Min-Max
         min_p, max_p = df["Prix_unitaire"].min(), df["Prix_unitaire"].max()
         df["Prix_normalise"] = ((df["Prix_unitaire"] - min_p) / (max_p - min_p)).round(4)
-        logger.info(f"  T2 OK - Colonne 'Prix_normalise' ajoutee (min={min_p}, max={max_p})")
+        logger.info(f"  T2 OK - 'Prix_normalise' ajoutee (min={min_p}, max={max_p})")
 
-        # T3 : Agregation mensuelle
         df["Date_vente"] = pd.to_datetime(df["Date_vente"], errors="coerce")
         df["Mois"] = df["Date_vente"].dt.to_period("M").astype(str)
         agg = (
@@ -259,46 +428,96 @@ def transform(df: pd.DataFrame):
             .reset_index()
         )
         logger.info(f"  T3 OK - Agregation mensuelle : {len(agg)} lignes")
-
         return df, agg
-
     except Exception as e:
         logger.error(f"Erreur transformation : {e}")
         raise
 
 
-# ─────────────────────────────────────────────
-# 9. PIPELINE PRINCIPAL
-# ─────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+# 6. PIPELINE PRINCIPAL (avec sauvegarde & historisation)
+# ════════════════════════════════════════════════════════════
+
 def run_pipeline(filepath: str):
-    """Execute toutes les etapes du pipeline ETL."""
-    logger.info("DEMARRAGE DU PIPELINE ETL")
+    """
+    Pipeline ETL complet avec :
+      - sauvegarde locale à chaque étape (raw / cleaned / transformed)
+      - manifeste JSON par exécution
+      - registre global d'historique
+      - upload cloud optionnel (GCS / S3)
+    """
+    storage = StorageManager()
+    meta = {"statut": "OK", "source": filepath}
 
-    df = load_data(filepath)
-    analyze_data(df)
+    try:
+        logger.info("DEMARRAGE DU PIPELINE ETL")
 
-    df = handle_missing_values(df)
-    validate(df, "handle_missing_values")
+        # ── Extract ──────────────────────────────────────────
+        df_raw = load_data(filepath)
+        meta["lignes_brutes"] = len(df_raw)
+        storage.save(df_raw, "raw")          # sauvegarde données brutes
 
-    df = handle_outliers(df)
-    validate(df, "handle_outliers")
+        report = analyze_data(df_raw)
+        meta["analyse"] = report
 
-    df = remove_duplicates(df)
-    validate(df, "remove_duplicates")
+        # ── Clean ────────────────────────────────────────────
+        df = handle_missing_values(df_raw)
+        validate(df, "handle_missing_values")
 
-    df_clean, df_agg = transform(df)
-    validate(df_clean, "transform")
+        df = handle_outliers(df)
+        validate(df, "handle_outliers")
 
-    df_clean.to_csv("data_nettoyee.csv", index=False)
-    df_agg.to_csv("aggregation_mensuelle.csv", index=False)
-    logger.info("Pipeline termine. Fichiers sauvegardes.")
+        df = remove_duplicates(df)
+        validate(df, "remove_duplicates")
 
-    return df_clean, df_agg
+        meta["lignes_nettoyees"]  = len(df)
+        meta["doublons_supprimes"] = meta["lignes_brutes"] - len(df)
+        meta["checksum_cleaned"]  = StorageManager._md5(df)
+        storage.save(df, "cleaned")          # sauvegarde données nettoyées
+
+        # ── Transform ────────────────────────────────────────
+        df_clean, df_agg = transform(df)
+        validate(df_clean, "transform")
+
+        meta["lignes_transformees"] = len(df_clean)
+        storage.save(df_clean, "transformed")       # sauvegarde données transformées
+        storage.save(df_agg,   "aggregation")       # sauvegarde agrégation
+
+        # ── Historisation ────────────────────────────────────
+        storage.write_manifest(meta)
+        storage.register_run(meta)
+        storage.update_latest()
+
+        # ── Upload cloud (optionnel) ─────────────────────────
+        if GCS_ENABLED:
+            try:
+                gcs = GCSUploader(GCS_BUCKET_NAME, GCS_PROJECT_ID)
+                gcs.upload_run(storage.run_dir, storage.timestamp)
+            except Exception as e:
+                logger.warning(f"[GCS] Upload ignoré : {e}")
+
+        if S3_ENABLED:
+            try:
+                s3 = S3Uploader(S3_BUCKET_NAME, S3_REGION)
+                s3.upload_run(storage.run_dir, storage.timestamp)
+            except Exception as e:
+                logger.warning(f"[S3] Upload ignoré : {e}")
+
+        logger.info(f"Pipeline termine avec succes. Run ID : {storage.timestamp}")
+        return df_clean, df_agg, storage
+
+    except Exception as e:
+        meta["statut"] = f"ERREUR : {e}"
+        storage.write_manifest(meta)
+        storage.register_run(meta)
+        logger.error(f"Pipeline echoue : {e}")
+        raise
 
 
-# ─────────────────────────────────────────────
-# 10. TESTS UNITAIRES
-# ─────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+# 7. TESTS UNITAIRES
+# ════════════════════════════════════════════════════════════
+
 class TestETLPipeline(unittest.TestCase):
 
     def setUp(self):
@@ -316,19 +535,19 @@ class TestETLPipeline(unittest.TestCase):
 
     def test_missing_values_resolved(self):
         df = handle_missing_values(self.df)
-        self.assertEqual(df.isnull().sum().sum(), 0, "Des valeurs manquantes subsistent")
+        self.assertEqual(df.isnull().sum().sum(), 0)
 
     def test_outliers_no_zero_quantity(self):
         df = handle_missing_values(self.df)
         df = handle_outliers(df)
-        self.assertTrue((df["Quantite_vendue"] > 0).all(), "Des quantites <= 0 subsistent")
+        self.assertTrue((df["Quantite_vendue"] > 0).all())
 
     def test_duplicates_removed(self):
         df = handle_missing_values(self.df)
         df = handle_outliers(df)
         df = remove_duplicates(df)
         dupes = df.duplicated(subset=["Nom_produit", "Quantite_vendue", "Prix_unitaire", "Date_vente"]).sum()
-        self.assertEqual(dupes, 0, "Des doublons subsistent")
+        self.assertEqual(dupes, 0)
 
     def test_transform_columns_exist(self):
         df = handle_missing_values(self.df)
@@ -341,29 +560,60 @@ class TestETLPipeline(unittest.TestCase):
         df = handle_missing_values(self.df)
         df = handle_outliers(df)
         df, _ = transform(df)
-        self.assertTrue((df["Prix_normalise"] >= 0).all() and (df["Prix_normalise"] <= 1).all(),
-                        "Prix_normalise hors de [0, 1]")
+        self.assertTrue((df["Prix_normalise"] >= 0).all() and (df["Prix_normalise"] <= 1).all())
 
     def test_chiffre_affaires_positif(self):
         df = handle_missing_values(self.df)
         df = handle_outliers(df)
         df, _ = transform(df)
-        self.assertTrue((df["Chiffre_affaires"] > 0).all(), "Chiffre d'affaires negatif detecte")
+        self.assertTrue((df["Chiffre_affaires"] > 0).all())
+
+    def test_storage_creates_run_dir(self):
+        """Vérifie que StorageManager crée bien un dossier d'exécution."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sm = StorageManager(root=Path(tmp))
+            self.assertTrue(sm.run_dir.exists())
+
+    def test_storage_save_and_restore(self):
+        """Vérifie la sauvegarde et la restauration d'un DataFrame."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sm = StorageManager(root=Path(tmp))
+            df = handle_missing_values(self.df)
+            sm.save(df, "cleaned")
+            restored = sm.restore_version(sm.timestamp, "cleaned")
+            self.assertEqual(len(restored), len(df))
+
+    def test_registry_created(self):
+        """Vérifie que le registre d'historique est bien créé."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sm = StorageManager(root=Path(tmp))
+            sm.register_run({"lignes_brutes": 10, "lignes_nettoyees": 8,
+                             "doublons_supprimes": 2, "checksum_cleaned": "abc", "statut": "OK"})
+            registry = sm.list_history()
+            self.assertEqual(len(registry), 1)
+            self.assertEqual(registry.iloc[0]["statut"], "OK")
 
 
-# ─────────────────────────────────────────────
-# 11. POINT D'ENTREE
-# ─────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+# 8. POINT D'ENTRÉE
+# ════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    # --- Lancer le pipeline sur ton fichier ---
-    df_clean, df_agg = run_pipeline("jeux_de_données.csv")
+    # ── Lancer le pipeline ───────────────────────────────────
+    df_clean, df_agg, storage = run_pipeline("jeux_de_données.csv")
 
-    print("\nApercu des donnees nettoyees :")
+    print("\nApercu des donnees nettoyees et transformees :")
     print(df_clean.head(10).to_string(index=False))
 
     print("\nAgregation mensuelle :")
     print(df_agg.to_string(index=False))
 
-    # --- Lancer les tests unitaires ---
+    print("\nHistorique des executions :")
+    print(storage.list_history().to_string(index=False))
+
+    # ── Lancer les tests unitaires ──────────────────────────
     print("\nTests unitaires :")
     unittest.main(argv=[""], exit=False, verbosity=2)
