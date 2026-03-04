@@ -1,75 +1,82 @@
 import pandas as pd
+import numpy as np
 import logging
-import os
 
-# =============================
-# CONFIGURATION LOG
-# =============================
+# CONFIG LOG
 logging.basicConfig(
     filename="etl.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-def extract(path):
-    try:
-        df = pd.read_csv(path)
-        logging.info("Extraction réussie")
-        return df
-    except Exception as e:
-        logging.error(f"Erreur extraction : {e}")
-        raise
+# =========================
+# EXTRACT
+# =========================
+try:
+    df = pd.read_csv("jeux_de_données.csv")
+    logging.info("Extraction réussie")
+except Exception as e:
+    logging.error(f"Erreur extraction : {e}")
+    raise
 
-def transform(df):
-    # --- Valeurs manquantes ---
-    df["Nom_produit"] = df["Nom_produit"].fillna("Inconnu")
-    df["Quantite_vendue"] = df["Quantite_vendue"].fillna(df["Quantite_vendue"].median())
-    df["Prix_unitaire"] = df["Prix_unitaire"].fillna(df["Prix_unitaire"].median())
+print("=== AVANT TRAITEMENT ===")
+print("Valeurs manquantes :")
+print(df.isnull().sum())
+print("Doublons :", df.duplicated().sum())
 
-    # --- Suppression quantités invalides ---
-    df = df[df["Quantite_vendue"] > 0]
 
-    # --- Suppression doublons ---
-    df = df.drop_duplicates()
+# =========================
+# TRANSFORM
+# =========================
 
-    # --- Transformation 1 : chiffre d'affaires ---
-    df["Chiffre_affaires"] = df["Quantite_vendue"] * df["Prix_unitaire"]
+# 1. Gestion valeurs manquantes
 
-    # --- Transformation 2 : normalisation prix ---
-    df["Prix_normalise"] = (
-        (df["Prix_unitaire"] - df["Prix_unitaire"].min()) /
-        (df["Prix_unitaire"].max() - df["Prix_unitaire"].min())
-    )
+# Nom_produit → remplacer par "Inconnu"
+df["Nom_produit"] = df["Nom_produit"].fillna("Inconnu")
 
-    logging.info("Transformations appliquées")
-    return df
+# Quantité → médiane
+df["Quantite_vendue"] = df["Quantite_vendue"].fillna(df["Quantite_vendue"].median())
 
-def load(df, output_path):
-    df.to_csv(output_path, index=False)
-    logging.info("Chargement terminé")
+# Prix → médiane
+df["Prix_unitaire"] = df["Prix_unitaire"].fillna(df["Prix_unitaire"].median())
 
-def validate(df):
-    print("Valeurs manquantes :", df.isnull().sum().sum())
-    print("Doublons :", df.duplicated().sum())
-    print("Nombre de lignes :", len(df))
+logging.info("Valeurs manquantes traitées")
 
-def main():
-    input_path = "../data/jeux_de_données.csv"
-    output_path = "../data/ventes_clean.csv"
+# 2. Suppression quantités nulles ou négatives
+df = df[df["Quantite_vendue"] > 0]
 
-    df = extract(input_path)
+# 3. Suppression doublons
+df = df.drop_duplicates()
 
-    print("AVANT TRAITEMENT")
-    validate(df)
+logging.info("Doublons supprimés")
 
-    df = transform(df)
+# 4. Transformation 1 : Ajout Chiffre d'affaires
+df["Chiffre_affaires"] = df["Quantite_vendue"] * df["Prix_unitaire"]
 
-    print("\nAPRES TRAITEMENT")
-    validate(df)
+# 5. Transformation 2 : Normalisation du prix
+df["Prix_normalise"] = (
+    (df["Prix_unitaire"] - df["Prix_unitaire"].min()) /
+    (df["Prix_unitaire"].max() - df["Prix_unitaire"].min())
+)
 
-    assert df.isnull().sum().sum() == 0
+logging.info("Transformations ajoutées")
 
-    load(df, output_path)
 
-if __name__ == "__main__":
-    main()
+# =========================
+# VALIDATION
+# =========================
+
+print("\n=== APRES TRAITEMENT ===")
+print("Valeurs manquantes :")
+print(df.isnull().sum())
+print("Doublons :", df.duplicated().sum())
+print("Nombre lignes final :", len(df))
+
+assert df.isnull().sum().sum() == 0
+
+# =========================
+# LOAD
+# =========================
+
+df.to_csv("ventes_clean.csv", index=False)
+logging.info("Chargement terminé")
